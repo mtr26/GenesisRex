@@ -453,6 +453,7 @@ def build_artifact(
             "token_cache": args.token_cache,
             "tokenize_num_proc": args.tokenize_num_proc,
             "device": args.device,
+            "dtype": args.dtype,
         },
         "model_config": model_config,
         "param_stats": params,
@@ -499,6 +500,7 @@ def main(forced_model: str = None):
     parser.add_argument("--token_cache", default="wikitext103_mistral_tokens.pt")
     parser.add_argument("--tokenize_num_proc", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--output_json", default=None)
     args = parser.parse_args()
     if forced_model is not None:
@@ -507,6 +509,17 @@ def main(forced_model: str = None):
         args.output_json = f"benchmark_{args.model}.json"
 
     device = torch.device(args.device)
+    if args.dtype == "bf16":
+        train_dtype = torch.bfloat16
+    elif args.dtype == "fp16":
+        train_dtype = torch.float16
+    else:
+        train_dtype = torch.float32
+    if device.type == "cpu" and train_dtype != torch.float32:
+        print(f"CPU device selected; overriding dtype={args.dtype} to fp32")
+        train_dtype = torch.float32
+        args.dtype = "fp32"
+
     print("Loading Mistral tokenizer…")
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
     tokenizer.pad_token = tokenizer.eos_token
@@ -536,7 +549,7 @@ def main(forced_model: str = None):
         torch.cuda.empty_cache()
         model_config = dict(GENESIS_500M)
         cfg = GenesisConfig(**model_config)
-        model = Genesis(cfg).to(device)
+        model = Genesis(cfg).to(device=device, dtype=train_dtype)
         params = param_stats(model, args.model)
         print(f"\nGenesis params: {params['trainable_params_m']:.1f}M")
         total_steps = max(1, args.total_tokens // ((args.seq_len - 1) * args.batch_size))
@@ -562,7 +575,7 @@ def main(forced_model: str = None):
         torch.cuda.empty_cache()
         model_config = dict(REX_500M)
         cfg = REXConfig(**model_config)
-        model = REX(cfg).to(device)
+        model = REX(cfg).to(device=device, dtype=train_dtype)
         params = param_stats(model, args.model)
         print(f"\nREX params: {params['trainable_params_m']:.1f}M")
         opt = _make_rex_optimizer(model, lr=3e-4)
