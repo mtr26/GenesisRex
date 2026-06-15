@@ -48,7 +48,7 @@ from rexmodel import REX, REXConfig
 # --------------------------------------------------------------------------
 def _load_wikitext(tokenizer, split="train") -> torch.Tensor:
     from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
     texts = [t for t in ds["text"] if t.strip()]
     joined = tokenizer.eos_token.join(texts)
     ids = tokenizer(joined, return_tensors="pt",
