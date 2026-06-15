@@ -40,6 +40,7 @@ Install:
 import argparse
 import json
 import math
+import os
 import platform
 import sys
 import time
@@ -60,13 +61,60 @@ from rexmodel import REX, REXConfig
 # --------------------------------------------------------------------------
 # Data
 # --------------------------------------------------------------------------
-def _load_wikitext(tokenizer, split="train") -> torch.Tensor:
+def _load_wikitext(
+    tokenizer,
+    split="train",
+    token_cache: str = "wikitext103_mistral_tokens.pt",
+    tokenize_num_proc: int = None,
+) -> torch.Tensor:
     from datasets import load_dataset
+
+    cache_path = Path(token_cache) if token_cache else None
+    if cache_path is not None and cache_path.exists():
+        print(f"Loading token cache: {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
     ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
-    texts = [t for t in ds["text"] if t.strip()]
-    joined = tokenizer.eos_token.join(texts)
-    ids = tokenizer(joined, return_tensors="pt",
-                    truncation=False, add_special_tokens=False).input_ids[0]
+    ds = ds.filter(lambda ex: bool(ex["text"].strip()), num_proc=tokenize_num_proc)
+
+    eos = tokenizer.eos_token_id
+
+    def tokenize_batch(batch):
+        ids = tokenizer(
+            batch["text"],
+            add_special_tokens=False,
+            truncation=False,
+        )["input_ids"]
+        # Match the old `eos_token.join(texts)` behavior: insert exactly one EOS
+        # between non-empty WikiText lines, not after the final line.
+        joined = []
+        for item in ids:
+            if joined:
+                joined.append(eos)
+            joined.extend(item)
+        return {"input_ids": [joined]}
+
+    if tokenize_num_proc is None:
+        tokenize_num_proc = max(1, os.cpu_count() or 1)
+    tokenized = ds.map(
+        tokenize_batch,
+        batched=True,
+        batch_size=1024,
+        num_proc=tokenize_num_proc,
+        remove_columns=ds.column_names,
+        desc="Tokenizing WikiText-103",
+    )
+    pieces = tokenized["input_ids"]
+    flat = []
+    for piece in pieces:
+        if flat:
+            flat.append(eos)
+        flat.extend(piece)
+    ids = torch.tensor(flat, dtype=torch.long)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(ids, cache_path)
+        print(f"Saved token cache: {cache_path}")
     return ids
 
 
@@ -402,6 +450,8 @@ def build_artifact(
             "compile_mode": "reduce-overhead" if args.compile else None,
             "warmup_steps": args.warmup_steps,
             "num_workers": args.num_workers,
+            "token_cache": args.token_cache,
+            "tokenize_num_proc": args.tokenize_num_proc,
             "device": args.device,
         },
         "model_config": model_config,
@@ -446,6 +496,8 @@ def main(forced_model: str = None):
     parser.add_argument("--no_compile", dest="compile", action="store_false")
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--token_cache", default="wikitext103_mistral_tokens.pt")
+    parser.add_argument("--tokenize_num_proc", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_json", default=None)
     args = parser.parse_args()
@@ -460,7 +512,12 @@ def main(forced_model: str = None):
     tokenizer.pad_token = tokenizer.eos_token
 
     print("Tokenizing WikiText-103 train split…")
-    ids = _load_wikitext(tokenizer, split="train")
+    ids = _load_wikitext(
+        tokenizer,
+        split="train",
+        token_cache=args.token_cache,
+        tokenize_num_proc=args.tokenize_num_proc,
+    )
     print(f"  {len(ids):,} tokens available")
 
     dataset = ChunkedTokens(ids, args.seq_len)
