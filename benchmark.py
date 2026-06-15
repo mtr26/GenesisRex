@@ -1,5 +1,5 @@
 """
-Genesis vs REX — benchmark on WikiText-103.
+Single-model WikiText-103 benchmark for Genesis or REX.
 
 Measures:
   1. Peak GPU memory (training, per step)
@@ -14,14 +14,23 @@ Both models target ~500M parameters. Genesis uses:
 REX uses its original AdamW + standard CE (as shipped).
 
 Usage:
-    python benchmark.py \
+    python benchmark_genesis.py \
         --seq_len 1024 \
         --batch_size 8 \
         --total_tokens 15_000_000 \
         --log_every 100   # steps
 
-    # or just the genesis model:
+    python benchmark_rex.py \
+        --seq_len 1024 \
+        --batch_size 8 \
+        --total_tokens 15_000_000 \
+        --log_every 100
+
+    # Direct common entrypoint:
     python benchmark.py --model genesis
+
+    # Each run writes a JSON artifact by default:
+    #   benchmark_genesis.json / benchmark_rex.json
 
 Install:
     pip install datasets transformers torch
@@ -29,8 +38,13 @@ Install:
 """
 
 import argparse
+import json
 import math
+import platform
+import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterator
 
 import torch
@@ -161,15 +175,18 @@ def train_one(
     log_every: int,
     compile_model: bool,
     seq_len: int,
+    warmup_steps: int,
 ):
     model.train()
     if compile_model:
-        print(f"[{name}] torch.compile …")
-        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        print(f"[{name}] torch.compile(mode='reduce-overhead') …")
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
 
     tokens_seen = 0
+    timed_tokens = 0
     peak_mem = 0.0
-    t0 = time.perf_counter()
+    t0 = None
+    last_timed_time = None
     step = 0
     tokens_per_batch = (seq_len - 1) * loader.batch_size
     total_steps = max(1, total_tokens // tokens_per_batch)
@@ -177,7 +194,12 @@ def train_one(
     lr_base = 0.02 if name == "Genesis" else 3e-4
     lr_min = lr_base * 0.1
 
-    log_rows = []  # (step, tokens, loss, tok_per_sec, mem_gb)
+    log_rows = []
+    step_rows = []
+    last_loss = float("nan")
+    if warmup_steps <= 0:
+        t0 = time.perf_counter()
+        last_timed_time = t0
 
     for batch in loader:
         if tokens_seen >= total_tokens:
@@ -194,42 +216,125 @@ def train_one(
             else:
                 g["lr"] = lr
 
+        step_start = time.perf_counter()
         input_ids = batch.to(device)
         labels = input_ids
 
-        torch.cuda.reset_peak_memory_stats(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         out = model(input_ids=input_ids, labels=labels)
         loss = out.loss
+        last_loss = loss.item()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        mem = torch.cuda.max_memory_allocated(device) / 1e9
-        peak_mem = max(peak_mem, mem)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            mem = torch.cuda.max_memory_allocated(device) / 1e9
+        else:
+            mem = 0.0
+        now = time.perf_counter()
 
         tokens_this = labels[:, 1:].numel()
         tokens_seen += tokens_this
         step += 1
 
+        timed = step > warmup_steps
+        step_elapsed = now - step_start
+        elapsed = None
+        tok_s = 0.0
+        step_tok_s = 0.0
+
+        if step == warmup_steps:
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            peak_mem = 0.0
+            timed_tokens = 0
+            t0 = now
+            last_timed_time = now
+            step_rows.append({
+                "step": step,
+                "tokens_seen": tokens_seen,
+                "tokens_this_step": tokens_this,
+                "timed_tokens": timed_tokens,
+                "loss": last_loss,
+                "lr": lr,
+                "step_time_s": step_elapsed,
+                "step_tok_per_s": step_tok_s,
+                "cumulative_tok_per_s": tok_s,
+                "elapsed_timed_s": elapsed,
+                "step_peak_mem_gb": mem,
+                "peak_mem_gb": peak_mem,
+                "timed": False,
+                "warmup_boundary": True,
+            })
+            print(f"[{name}] warmup complete after {step} step(s); timing starts now")
+            continue
+
+        if timed:
+            timed_tokens += tokens_this
+            peak_mem = max(peak_mem, mem)
+            elapsed = now - t0 if t0 is not None else 0.0
+            tok_s = timed_tokens / elapsed if elapsed > 0 else 0.0
+            if last_timed_time is not None:
+                step_dt = now - last_timed_time
+                step_tok_s = tokens_this / step_dt if step_dt > 0 else 0.0
+            last_timed_time = now
+        else:
+            peak_mem = max(peak_mem, mem)
+
+        step_rows.append({
+            "step": step,
+            "tokens_seen": tokens_seen,
+            "tokens_this_step": tokens_this,
+            "timed_tokens": timed_tokens,
+            "loss": last_loss,
+            "lr": lr,
+            "step_time_s": step_elapsed,
+            "step_tok_per_s": step_tok_s,
+            "cumulative_tok_per_s": tok_s,
+            "elapsed_timed_s": elapsed,
+            "step_peak_mem_gb": mem,
+            "peak_mem_gb": peak_mem,
+            "timed": timed,
+            "warmup_boundary": False,
+        })
+
         if step % log_every == 0:
-            elapsed = time.perf_counter() - t0
-            tok_s = tokens_seen / elapsed
             print(
                 f"[{name}] step={step:>5d}  tokens={tokens_seen/1e6:.2f}M"
-                f"  loss={loss.item():.4f}  {tok_s:,.0f} tok/s"
+                f"  loss={last_loss:.4f}  {tok_s:,.0f} tok/s"
                 f"  peak_mem={peak_mem:.2f} GB"
             )
-            log_rows.append((step, tokens_seen, loss.item(), tok_s, peak_mem))
+            log_rows.append({
+                "step": step,
+                "tokens_seen": tokens_seen,
+                "loss": last_loss,
+                "cumulative_tok_per_s": tok_s,
+                "peak_mem_gb": peak_mem,
+            })
 
+    if t0 is None:
+        t0 = time.perf_counter()
     elapsed = time.perf_counter() - t0
     return {
         "name": name,
         "total_tokens": tokens_seen,
         "elapsed_s": elapsed,
-        "tok_per_s": tokens_seen / elapsed,
+        "tok_per_s": timed_tokens / elapsed if elapsed > 0 else 0.0,
         "peak_mem_gb": peak_mem,
+        "final_loss": last_loss,
+        "timed_tokens": timed_tokens,
+        "warmup_steps": warmup_steps,
+        "total_steps": step,
+        "target_steps": total_steps,
+        "lr_base": lr_base,
+        "lr_min": lr_min,
+        "lr_warmup_steps": warmup,
         "log": log_rows,
+        "steps": step_rows,
     }
 
 
@@ -240,20 +345,114 @@ def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
+def param_stats(model, model_key: str):
+    total = count_params(model)
+    stats = {
+        "trainable_params": total,
+        "trainable_params_m": total / 1e6,
+    }
+    if hasattr(model, "embedding"):
+        stats["embedding_params"] = model.embedding.weight.numel()
+    if model_key == "genesis":
+        stats["lm_head_params"] = model.lm_head.weight.numel()
+        stats["tied_embeddings"] = model.embedding.weight is model.lm_head.weight
+    if model_key == "rex":
+        stats["lm_head_params"] = model.fc_out.weight.numel()
+        stats["tied_embeddings"] = model.embedding.weight is model.fc_out.weight
+        dead_w3 = sum(block.ff.w3.weight.numel() for block in model.blocks)
+        stats["rex_dead_w3_params"] = dead_w3
+        stats["active_params_excluding_dead_w3"] = total - dead_w3
+        stats["active_params_excluding_dead_w3_m"] = (total - dead_w3) / 1e6
+    return stats
+
+
+def build_artifact(
+    *,
+    args,
+    name: str,
+    model_key: str,
+    model_config: dict,
+    params: dict,
+    data_tokens_available: int,
+    result: dict,
+):
+    return {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "model": model_key,
+        "name": name,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        "tokenizer": "mistralai/Mistral-7B-v0.1",
+        "dataset": {
+            "name": "Salesforce/wikitext",
+            "config": "wikitext-103-raw-v1",
+            "split": "train",
+            "tokens_available": data_tokens_available,
+        },
+        "benchmark": {
+            "seq_len": args.seq_len,
+            "batch_size": args.batch_size,
+            "requested_total_tokens": args.total_tokens,
+            "log_every": args.log_every,
+            "compile": args.compile,
+            "compile_mode": "reduce-overhead" if args.compile else None,
+            "warmup_steps": args.warmup_steps,
+            "num_workers": args.num_workers,
+            "device": args.device,
+        },
+        "model_config": model_config,
+        "param_stats": params,
+        "summary": {
+            "total_tokens": result["total_tokens"],
+            "timed_tokens": result["timed_tokens"],
+            "total_steps": result["total_steps"],
+            "target_steps": result["target_steps"],
+            "elapsed_timed_s": result["elapsed_s"],
+            "tok_per_s": result["tok_per_s"],
+            "peak_mem_gb": result["peak_mem_gb"],
+            "final_loss": result["final_loss"],
+            "lr_base": result["lr_base"],
+            "lr_min": result["lr_min"],
+            "lr_warmup_steps": result["lr_warmup_steps"],
+        },
+        "logs": result["log"],
+        "steps": result["steps"],
+    }
+
+
+def write_artifact(path: str, artifact: dict):
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    print(f"Wrote JSON artifact: {out}")
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-def main():
+def main(forced_model: str = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["both", "genesis", "rex"], default="both")
+    if forced_model is None:
+        parser.add_argument("--model", choices=["genesis", "rex"], default="genesis")
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--total_tokens", type=int, default=15_000_000)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--compile", action="store_true", default=True)
     parser.add_argument("--no_compile", dest="compile", action="store_false")
+    parser.add_argument("--warmup_steps", type=int, default=3)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--output_json", default=None)
     args = parser.parse_args()
+    if forced_model is not None:
+        args.model = forced_model
+    if args.output_json is None:
+        args.output_json = f"benchmark_{args.model}.json"
 
     device = torch.device(args.device)
     print("Loading Mistral tokenizer…")
@@ -265,32 +464,64 @@ def main():
     print(f"  {len(ids):,} tokens available")
 
     dataset = ChunkedTokens(ids, args.seq_len)
-    loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=2,
-                        pin_memory=True, prefetch_factor=4)
+    loader_kwargs = dict(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+    loader = DataLoader(dataset, **loader_kwargs)
 
     results = []
 
-    if args.model in ("both", "genesis"):
+    if args.model == "genesis":
         torch.cuda.empty_cache()
-        cfg = GenesisConfig(**GENESIS_500M)
+        model_config = dict(GENESIS_500M)
+        cfg = GenesisConfig(**model_config)
         model = Genesis(cfg).to(device)
-        print(f"\nGenesis params: {count_params(model)/1e6:.1f}M")
+        params = param_stats(model, args.model)
+        print(f"\nGenesis params: {params['trainable_params_m']:.1f}M")
         total_steps = max(1, args.total_tokens // ((args.seq_len - 1) * args.batch_size))
         opt = _make_genesis_optimizer(model, lr=0.02, total_steps=total_steps)
         r = train_one("Genesis", model, opt, loader, device,
-                      args.total_tokens, args.log_every, args.compile, args.seq_len)
+                      args.total_tokens, args.log_every, args.compile,
+                      args.seq_len, args.warmup_steps)
+        artifact = build_artifact(
+            args=args,
+            name="Genesis",
+            model_key=args.model,
+            model_config=model_config,
+            params=params,
+            data_tokens_available=len(ids),
+            result=r,
+        )
+        write_artifact(args.output_json, artifact)
         results.append(r)
         del model, opt
         torch.cuda.empty_cache()
 
-    if args.model in ("both", "rex"):
+    if args.model == "rex":
         torch.cuda.empty_cache()
-        cfg = REXConfig(**REX_500M)
+        model_config = dict(REX_500M)
+        cfg = REXConfig(**model_config)
         model = REX(cfg).to(device)
-        print(f"\nREX params: {count_params(model)/1e6:.1f}M")
+        params = param_stats(model, args.model)
+        print(f"\nREX params: {params['trainable_params_m']:.1f}M")
         opt = _make_rex_optimizer(model, lr=3e-4)
         r = train_one("REX", model, opt, loader, device,
-                      args.total_tokens, args.log_every, args.compile, args.seq_len)
+                      args.total_tokens, args.log_every, args.compile,
+                      args.seq_len, args.warmup_steps)
+        artifact = build_artifact(
+            args=args,
+            name="REX",
+            model_key=args.model,
+            model_config=model_config,
+            params=params,
+            data_tokens_available=len(ids),
+            result=r,
+        )
+        write_artifact(args.output_json, artifact)
         results.append(r)
         del model, opt
         torch.cuda.empty_cache()
@@ -302,14 +533,7 @@ def main():
         print(f"\n{r['name']}")
         print(f"  Throughput:   {r['tok_per_s']:,.0f} tokens/s")
         print(f"  Peak memory:  {r['peak_mem_gb']:.2f} GB")
-        final_loss = r["log"][-1][2] if r["log"] else float("nan")
-        print(f"  Final loss:   {final_loss:.4f}")
-
-    if len(results) == 2:
-        g, rx = results if results[0]["name"] == "Genesis" else results[::-1]
-        print(f"\n  Throughput Δ: {g['tok_per_s'] / rx['tok_per_s']:.2f}× (Genesis/REX)")
-        print(f"  Memory Δ:     {rx['peak_mem_gb'] / g['peak_mem_gb']:.2f}× less (Genesis vs REX)")
-        print(f"  Loss Δ:       {g['log'][-1][2] - rx['log'][-1][2]:+.4f} (Genesis - REX)")
+        print(f"  Final loss:   {r['final_loss']:.4f}")
 
 
 if __name__ == "__main__":
