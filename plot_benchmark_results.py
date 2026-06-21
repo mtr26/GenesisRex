@@ -9,7 +9,14 @@ def load_run(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     data["_path"] = str(path)
-    data["_label"] = data.get("name") or data.get("model") or Path(path).stem
+    optimizer = data.get("benchmark", {}).get("optimizer") or data.get("optimizer", {}).get("optimizer")
+    if data.get("name"):
+        label = data["name"]
+    elif data.get("model") and optimizer:
+        label = f"{data['model']} + {optimizer}"
+    else:
+        label = data.get("model") or Path(path).stem
+    data["_label"] = label
     return data
 
 
@@ -27,6 +34,10 @@ def step_series(run, key, timed_only=False):
 
 
 def choose_baseline(runs):
+    for run in runs:
+        optimizer = run.get("benchmark", {}).get("optimizer") or run.get("optimizer", {}).get("optimizer")
+        if run.get("model") == "rex" and optimizer == "adamw":
+            return run
     for run in runs:
         if run.get("model") == "rex":
             return run
@@ -149,7 +160,8 @@ def main():
         subtitle.append(
             f"{run['_label']}: "
             f"{s.get('tok_per_s', 0):,.0f} tok/s, "
-            f"{s.get('peak_mem_gb', 0):.2f} GB, "
+            f"{s.get('peak_mem_gb', 0):.2f} GB alloc, "
+            f"{s.get('peak_reserved_mem_gb', 0):.2f} GB reserved, "
             f"loss {s.get('final_loss', 0):.4f}, "
             f"{p.get('trainable_params_m', 0):.1f}M params"
         )

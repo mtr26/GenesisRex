@@ -6,12 +6,17 @@ Measures:
   2. Throughput (tokens/sec)
   3. Convergence speed (loss curve over 15M tokens)
 
-Both models target ~500M parameters. Genesis uses:
-  - Muon (matrices) + AdamW (embeddings / norms)
+Both models target ~500M parameters. Optimizer arms are selectable:
+  - adamw:       AdamW over all trainable params
+  - local_muon:  local Muon for hidden matrices + AdamW for embeddings / norms / heads
+  - flash_muon:  nil0x9/flash-muon for hidden matrices + AdamW fallback
+
+Genesis uses:
   - Chunked cross-entropy (no logit materialization)
   - torch.compile
 
-REX uses its original AdamW + standard CE (as shipped).
+REX uses standard CE (as shipped). REX's dead w3 weights are excluded from
+Muon arms because they never receive gradients.
 
 Usage:
     python benchmark_genesis.py \
@@ -27,10 +32,13 @@ Usage:
         --log_every 100
 
     # Direct common entrypoint:
-    python benchmark.py --model genesis
+    python benchmark.py --model genesis --optimizer local_muon
+
+    # Full isolated model x optimizer matrix:
+    python run_full_benchmark.py --out_dir runs/full_benchmark
 
     # Each run writes a JSON artifact by default:
-    #   benchmark_genesis.json / benchmark_rex.json
+    #   benchmark_<model>_<optimizer>.json
 
 Install:
     pip install datasets transformers torch
@@ -44,7 +52,9 @@ import os
 import platform
 import sys
 import time
+import tempfile
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -170,37 +180,267 @@ GENESIS_500M = dict(
 # --------------------------------------------------------------------------
 # Optimizers
 # --------------------------------------------------------------------------
-def _make_genesis_optimizer(model: Genesis, lr: float, total_steps: int):
-    # Embeddings + norms + scalars -> Adam.
-    embed_ids = {id(model.embedding.weight)}
-    scalar_params, matrix_params = [], []
-    for p in model.parameters():
+OPTIMIZER_CHOICES = ("adamw", "local_muon", "flash_muon")
+
+
+@dataclass
+class OptimizerSplit:
+    muon_params: list
+    adam_params: list
+    excluded_params: list
+    muon_param_count: int
+    adam_param_count: int
+    excluded_param_count: int
+
+
+class OptimizerBundle:
+    """Small adapter for recipes that use separate Muon and AdamW optimizers."""
+
+    def __init__(self, optimizers):
+        self.optimizers = list(optimizers)
+
+    @property
+    def param_groups(self):
+        groups = []
+        for optimizer in self.optimizers:
+            groups.extend(optimizer.param_groups)
+        return groups
+
+    def step(self):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+    def zero_grad(self, *args, **kwargs):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(*args, **kwargs)
+
+
+def _param_count(params) -> int:
+    return sum(p.numel() for p in params)
+
+
+def _module_param_ids(module) -> set:
+    if module is None:
+        return set()
+    return {id(p) for p in module.parameters()}
+
+
+def _rex_dead_w3_param_ids(model) -> set:
+    if not hasattr(model, "blocks"):
+        return set()
+    ids = set()
+    for block in model.blocks:
+        ff = getattr(block, "ff", None)
+        w3 = getattr(ff, "w3", None)
+        if w3 is not None:
+            ids.update(id(p) for p in w3.parameters())
+    return ids
+
+
+def split_optimizer_params(model: torch.nn.Module, model_key: str) -> OptimizerSplit:
+    """Split trainable params into hidden matrices for Muon and Adam fallback params."""
+
+    adam_param_ids = set()
+    for attr in ("embedding", "lm_head", "fc_out"):
+        adam_param_ids.update(_module_param_ids(getattr(model, attr, None)))
+
+    excluded_ids = _rex_dead_w3_param_ids(model) if model_key == "rex" else set()
+
+    muon_params, adam_params, excluded_params = [], [], []
+    seen = set()
+    for _, p in model.named_parameters():
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
         if not p.requires_grad:
             continue
-        if p.ndim < 2 or id(p) in embed_ids:
-            scalar_params.append(p)
+        if pid in excluded_ids:
+            excluded_params.append(p)
+        elif p.ndim >= 2 and pid not in adam_param_ids:
+            muon_params.append(p)
         else:
-            matrix_params.append(p)
+            adam_params.append(p)
 
-    return Muon(
-        [
-            {"params": matrix_params, "use_muon": True},
-            {
-                "params": scalar_params,
-                "use_muon": False,
-                "adam_lr": 3e-4,
-                "adam_betas": (0.9, 0.95),
-                "adam_eps": 1e-8,
-                "wd": 0.1,
-            },
-        ],
-        lr=lr, wd=0.1,
+    return OptimizerSplit(
+        muon_params=muon_params,
+        adam_params=adam_params,
+        excluded_params=excluded_params,
+        muon_param_count=_param_count(muon_params),
+        adam_param_count=_param_count(adam_params),
+        excluded_param_count=_param_count(excluded_params),
     )
 
 
-def _make_rex_optimizer(model: REX, lr: float):
-    return torch.optim.AdamW(model.parameters(), lr=lr,
-                             betas=(0.9, 0.95), weight_decay=0.1)
+def _tag_group(group: dict, *, role: str, base_lr: float, min_lr: float, lr_key: str = "lr"):
+    group["optimizer_role"] = role
+    group["schedule_role"] = role
+    group["schedule_lr_key"] = lr_key
+    group["schedule_base_lr"] = base_lr
+    group["schedule_min_lr"] = min_lr
+    group[lr_key] = base_lr
+    if lr_key != "lr":
+        group["lr"] = base_lr
+
+
+def _tag_optimizer_groups(optimizer, *, role: str, base_lr: float, min_lr: float, lr_key: str = "lr"):
+    for group in optimizer.param_groups:
+        _tag_group(group, role=role, base_lr=base_lr, min_lr=min_lr, lr_key=lr_key)
+
+
+def _import_flash_muon():
+    try:
+        from flash_muon import Muon as FlashMuon
+    except ImportError as exc:
+        raise RuntimeError(
+            "flash_muon optimizer requested but the package is not installed. "
+            "Install with: git clone https://github.com/nil0x9/flash-muon.git && "
+            "pip install -e flash-muon/"
+        ) from exc
+    return FlashMuon
+
+
+def _ensure_single_process_group(device: torch.device):
+    import torch.distributed as dist
+
+    if not dist.is_available() or dist.is_initialized():
+        return
+    backend = "nccl" if device.type == "cuda" and dist.is_nccl_available() else "gloo"
+    init_file = tempfile.NamedTemporaryFile(prefix="flash_muon_pg_", delete=False)
+    init_file.close()
+    dist.init_process_group(
+        backend=backend,
+        rank=0,
+        world_size=1,
+        init_method=f"file://{init_file.name}",
+    )
+
+
+def make_optimizer(
+    model: torch.nn.Module,
+    *,
+    model_key: str,
+    optimizer_key: str,
+    muon_lr: float,
+    adam_lr: float,
+    weight_decay: float,
+    device: torch.device,
+    min_lr_ratio: float = 0.1,
+):
+    if optimizer_key not in OPTIMIZER_CHOICES:
+        raise ValueError(f"Unknown optimizer '{optimizer_key}'. Choices: {OPTIMIZER_CHOICES}")
+
+    muon_min_lr = muon_lr * min_lr_ratio
+    adam_min_lr = adam_lr * min_lr_ratio
+
+    if optimizer_key == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=adam_lr,
+            betas=(0.9, 0.95),
+            weight_decay=weight_decay,
+        )
+        _tag_optimizer_groups(optimizer, role="adam", base_lr=adam_lr, min_lr=adam_min_lr)
+        total = count_params(model)
+        return optimizer, {
+            "optimizer": optimizer_key,
+            "muon_param_count": 0,
+            "adam_param_count": total,
+            "excluded_param_count": 0,
+            "muon_param_count_m": 0.0,
+            "adam_param_count_m": total / 1e6,
+            "excluded_param_count_m": 0.0,
+        }
+
+    split = split_optimizer_params(model, model_key=model_key)
+    if not split.muon_params:
+        raise RuntimeError(f"{optimizer_key} requested but no hidden matrix parameters were found")
+
+    if optimizer_key == "local_muon":
+        optimizer = Muon(
+            [
+                {
+                    "params": split.muon_params,
+                    "use_muon": True,
+                    "lr": muon_lr,
+                },
+                {
+                    "params": split.adam_params,
+                    "use_muon": False,
+                    "lr": adam_lr,
+                    "adam_lr": adam_lr,
+                    "adam_betas": (0.9, 0.95),
+                    "adam_eps": 1e-8,
+                    "wd": weight_decay,
+                },
+            ],
+            lr=muon_lr,
+            wd=weight_decay,
+        )
+        _tag_group(
+            optimizer.param_groups[0],
+            role="muon",
+            base_lr=muon_lr,
+            min_lr=muon_min_lr,
+        )
+        _tag_group(
+            optimizer.param_groups[1],
+            role="adam_aux",
+            base_lr=adam_lr,
+            min_lr=adam_min_lr,
+            lr_key="adam_lr",
+        )
+    else:
+        if device.type != "cuda":
+            raise RuntimeError("flash_muon requires CUDA because its optimizer allocates CUDA update buffers")
+        FlashMuon = _import_flash_muon()
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        _ensure_single_process_group(device)
+        muon_optimizer = FlashMuon(
+            split.muon_params,
+            lr=muon_lr,
+            weight_decay=weight_decay,
+            momentum=0.95,
+            rank=0,
+            world_size=1,
+        )
+        adam_optimizer = torch.optim.AdamW(
+            split.adam_params,
+            lr=adam_lr,
+            betas=(0.9, 0.95),
+            weight_decay=weight_decay,
+        )
+        _tag_optimizer_groups(muon_optimizer, role="muon", base_lr=muon_lr, min_lr=muon_min_lr)
+        _tag_optimizer_groups(adam_optimizer, role="adam_aux", base_lr=adam_lr, min_lr=adam_min_lr)
+        optimizer = OptimizerBundle([muon_optimizer, adam_optimizer])
+
+    return optimizer, {
+        "optimizer": optimizer_key,
+        "muon_param_count": split.muon_param_count,
+        "adam_param_count": split.adam_param_count,
+        "excluded_param_count": split.excluded_param_count,
+        "muon_param_count_m": split.muon_param_count / 1e6,
+        "adam_param_count_m": split.adam_param_count / 1e6,
+        "excluded_param_count_m": split.excluded_param_count / 1e6,
+    }
+
+
+def _set_optimizer_lrs(optimizer, step: int, warmup: int, total_steps: int):
+    snapshot = {}
+    for idx, group in enumerate(optimizer.param_groups):
+        base_lr = group.get("schedule_base_lr", group["lr"])
+        min_lr = group.get("schedule_min_lr", base_lr * 0.1)
+        lr_key = group.get("schedule_lr_key", "lr")
+        lr = _cosine_lr(step, warmup, total_steps, base_lr, min_lr)
+        group[lr_key] = lr
+        if lr_key != "lr":
+            group["lr"] = lr
+        role = group.get("schedule_role", f"group_{idx}")
+        if role in snapshot:
+            role = f"{role}_{idx}"
+        snapshot[role] = lr
+    return snapshot
 
 
 def _cosine_lr(step: int, warmup: int, total: int, lr_max: float, lr_min: float):
@@ -224,6 +464,7 @@ def train_one(
     compile_model: bool,
     seq_len: int,
     warmup_steps: int,
+    grad_clip: float,
 ):
     model.train()
     if compile_model:
@@ -233,14 +474,13 @@ def train_one(
     tokens_seen = 0
     timed_tokens = 0
     peak_mem = 0.0
+    peak_reserved_mem = 0.0
     t0 = None
     last_timed_time = None
     step = 0
     tokens_per_batch = (seq_len - 1) * loader.batch_size
     total_steps = max(1, total_tokens // tokens_per_batch)
     warmup = max(1, total_steps // 20)
-    lr_base = 0.02 if name == "Genesis" else 3e-4
-    lr_min = lr_base * 0.1
 
     log_rows = []
     step_rows = []
@@ -254,15 +494,8 @@ def train_one(
             break
 
         # LR schedule.
-        lr = _cosine_lr(step, warmup, total_steps, lr_base, lr_min)
-        for g in optimizer.param_groups:
-            if name == "Genesis":
-                if g.get("use_muon", True):
-                    g["lr"] = lr
-                else:
-                    g["adam_lr"] = lr * 0.15   # Adam LR tracks Muon
-            else:
-                g["lr"] = lr
+        lrs = _set_optimizer_lrs(optimizer, step, warmup, total_steps)
+        primary_lr = next(iter(lrs.values())) if lrs else 0.0
 
         step_start = time.perf_counter()
         input_ids = batch.to(device)
@@ -274,15 +507,18 @@ def train_one(
         loss = out.loss
         last_loss = loss.item()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             mem = torch.cuda.max_memory_allocated(device) / 1e9
+            reserved_mem = torch.cuda.max_memory_reserved(device) / 1e9
         else:
             mem = 0.0
+            reserved_mem = 0.0
         now = time.perf_counter()
 
         tokens_this = labels[:, 1:].numel()
@@ -299,6 +535,7 @@ def train_one(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             peak_mem = 0.0
+            peak_reserved_mem = 0.0
             timed_tokens = 0
             t0 = now
             last_timed_time = now
@@ -308,13 +545,16 @@ def train_one(
                 "tokens_this_step": tokens_this,
                 "timed_tokens": timed_tokens,
                 "loss": last_loss,
-                "lr": lr,
+                "lr": primary_lr,
+                "lrs": lrs,
                 "step_time_s": step_elapsed,
                 "step_tok_per_s": step_tok_s,
                 "cumulative_tok_per_s": tok_s,
                 "elapsed_timed_s": elapsed,
                 "step_peak_mem_gb": mem,
+                "step_peak_reserved_mem_gb": reserved_mem,
                 "peak_mem_gb": peak_mem,
+                "peak_reserved_mem_gb": peak_reserved_mem,
                 "timed": False,
                 "warmup_boundary": True,
             })
@@ -324,6 +564,7 @@ def train_one(
         if timed:
             timed_tokens += tokens_this
             peak_mem = max(peak_mem, mem)
+            peak_reserved_mem = max(peak_reserved_mem, reserved_mem)
             elapsed = now - t0 if t0 is not None else 0.0
             tok_s = timed_tokens / elapsed if elapsed > 0 else 0.0
             if last_timed_time is not None:
@@ -332,6 +573,7 @@ def train_one(
             last_timed_time = now
         else:
             peak_mem = max(peak_mem, mem)
+            peak_reserved_mem = max(peak_reserved_mem, reserved_mem)
 
         step_rows.append({
             "step": step,
@@ -339,13 +581,16 @@ def train_one(
             "tokens_this_step": tokens_this,
             "timed_tokens": timed_tokens,
             "loss": last_loss,
-            "lr": lr,
+            "lr": primary_lr,
+            "lrs": lrs,
             "step_time_s": step_elapsed,
             "step_tok_per_s": step_tok_s,
             "cumulative_tok_per_s": tok_s,
             "elapsed_timed_s": elapsed,
             "step_peak_mem_gb": mem,
+            "step_peak_reserved_mem_gb": reserved_mem,
             "peak_mem_gb": peak_mem,
+            "peak_reserved_mem_gb": peak_reserved_mem,
             "timed": timed,
             "warmup_boundary": False,
         })
@@ -355,6 +600,7 @@ def train_one(
                 f"[{name}] step={step:>5d}  tokens={tokens_seen/1e6:.2f}M"
                 f"  loss={last_loss:.4f}  {tok_s:,.0f} tok/s"
                 f"  peak_mem={peak_mem:.2f} GB"
+                f"  reserved={peak_reserved_mem:.2f} GB"
             )
             log_rows.append({
                 "step": step,
@@ -362,6 +608,7 @@ def train_one(
                 "loss": last_loss,
                 "cumulative_tok_per_s": tok_s,
                 "peak_mem_gb": peak_mem,
+                "peak_reserved_mem_gb": peak_reserved_mem,
             })
 
     if t0 is None:
@@ -373,13 +620,20 @@ def train_one(
         "elapsed_s": elapsed,
         "tok_per_s": timed_tokens / elapsed if elapsed > 0 else 0.0,
         "peak_mem_gb": peak_mem,
+        "peak_reserved_mem_gb": peak_reserved_mem,
         "final_loss": last_loss,
         "timed_tokens": timed_tokens,
         "warmup_steps": warmup_steps,
         "total_steps": step,
         "target_steps": total_steps,
-        "lr_base": lr_base,
-        "lr_min": lr_min,
+        "lr_bases": {
+            group.get("schedule_role", f"group_{i}"): group.get("schedule_base_lr", group["lr"])
+            for i, group in enumerate(optimizer.param_groups)
+        },
+        "lr_mins": {
+            group.get("schedule_role", f"group_{i}"): group.get("schedule_min_lr", group["lr"])
+            for i, group in enumerate(optimizer.param_groups)
+        },
         "lr_warmup_steps": warmup,
         "log": log_rows,
         "steps": step_rows,
@@ -421,6 +675,7 @@ def build_artifact(
     model_key: str,
     model_config: dict,
     params: dict,
+    optimizer_metadata: dict,
     data_tokens_available: int,
     result: dict,
 ):
@@ -454,9 +709,16 @@ def build_artifact(
             "tokenize_num_proc": args.tokenize_num_proc,
             "device": args.device,
             "dtype": args.dtype,
+            "optimizer": args.optimizer,
+            "muon_lr": args.muon_lr,
+            "adam_lr": args.adam_lr,
+            "min_lr_ratio": args.min_lr_ratio,
+            "weight_decay": args.weight_decay,
+            "grad_clip": args.grad_clip,
         },
         "model_config": model_config,
         "param_stats": params,
+        "optimizer": optimizer_metadata,
         "summary": {
             "total_tokens": result["total_tokens"],
             "timed_tokens": result["timed_tokens"],
@@ -465,9 +727,10 @@ def build_artifact(
             "elapsed_timed_s": result["elapsed_s"],
             "tok_per_s": result["tok_per_s"],
             "peak_mem_gb": result["peak_mem_gb"],
+            "peak_reserved_mem_gb": result["peak_reserved_mem_gb"],
             "final_loss": result["final_loss"],
-            "lr_base": result["lr_base"],
-            "lr_min": result["lr_min"],
+            "lr_bases": result["lr_bases"],
+            "lr_mins": result["lr_mins"],
             "lr_warmup_steps": result["lr_warmup_steps"],
         },
         "logs": result["log"],
@@ -501,12 +764,20 @@ def main(forced_model: str = None):
     parser.add_argument("--tokenize_num_proc", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument("--optimizer", choices=OPTIMIZER_CHOICES, default=None)
+    parser.add_argument("--muon_lr", type=float, default=0.02)
+    parser.add_argument("--adam_lr", type=float, default=3e-4)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--output_json", default=None)
     args = parser.parse_args()
     if forced_model is not None:
         args.model = forced_model
+    if args.optimizer is None:
+        args.optimizer = "local_muon" if args.model == "genesis" else "adamw"
     if args.output_json is None:
-        args.output_json = f"benchmark_{args.model}.json"
+        args.output_json = f"benchmark_{args.model}_{args.optimizer}.json"
 
     device = torch.device(args.device)
     if args.dtype == "bf16":
@@ -552,17 +823,27 @@ def main(forced_model: str = None):
         model = Genesis(cfg).to(device=device, dtype=train_dtype)
         params = param_stats(model, args.model)
         print(f"\nGenesis params: {params['trainable_params_m']:.1f}M")
-        total_steps = max(1, args.total_tokens // ((args.seq_len - 1) * args.batch_size))
-        opt = _make_genesis_optimizer(model, lr=0.02, total_steps=total_steps)
-        r = train_one("Genesis", model, opt, loader, device,
+        opt, opt_metadata = make_optimizer(
+            model,
+            model_key=args.model,
+            optimizer_key=args.optimizer,
+            muon_lr=args.muon_lr,
+            adam_lr=args.adam_lr,
+            weight_decay=args.weight_decay,
+            device=device,
+            min_lr_ratio=args.min_lr_ratio,
+        )
+        name = f"Genesis + {args.optimizer}"
+        r = train_one(name, model, opt, loader, device,
                       args.total_tokens, args.log_every, args.compile,
-                      args.seq_len, args.warmup_steps)
+                      args.seq_len, args.warmup_steps, args.grad_clip)
         artifact = build_artifact(
             args=args,
-            name="Genesis",
+            name=name,
             model_key=args.model,
             model_config=model_config,
             params=params,
+            optimizer_metadata=opt_metadata,
             data_tokens_available=len(ids),
             result=r,
         )
@@ -578,16 +859,27 @@ def main(forced_model: str = None):
         model = REX(cfg).to(device=device, dtype=train_dtype)
         params = param_stats(model, args.model)
         print(f"\nREX params: {params['trainable_params_m']:.1f}M")
-        opt = _make_rex_optimizer(model, lr=3e-4)
-        r = train_one("REX", model, opt, loader, device,
+        opt, opt_metadata = make_optimizer(
+            model,
+            model_key=args.model,
+            optimizer_key=args.optimizer,
+            muon_lr=args.muon_lr,
+            adam_lr=args.adam_lr,
+            weight_decay=args.weight_decay,
+            device=device,
+            min_lr_ratio=args.min_lr_ratio,
+        )
+        name = f"REX + {args.optimizer}"
+        r = train_one(name, model, opt, loader, device,
                       args.total_tokens, args.log_every, args.compile,
-                      args.seq_len, args.warmup_steps)
+                      args.seq_len, args.warmup_steps, args.grad_clip)
         artifact = build_artifact(
             args=args,
-            name="REX",
+            name=name,
             model_key=args.model,
             model_config=model_config,
             params=params,
+            optimizer_metadata=opt_metadata,
             data_tokens_available=len(ids),
             result=r,
         )
@@ -603,6 +895,7 @@ def main(forced_model: str = None):
         print(f"\n{r['name']}")
         print(f"  Throughput:   {r['tok_per_s']:,.0f} tokens/s")
         print(f"  Peak memory:  {r['peak_mem_gb']:.2f} GB")
+        print(f"  Reserved mem: {r['peak_reserved_mem_gb']:.2f} GB")
         print(f"  Final loss:   {r['final_loss']:.4f}")
 
 
