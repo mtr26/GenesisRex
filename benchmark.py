@@ -8,7 +8,6 @@ Measures:
 
 Both models target ~500M parameters. Optimizer arms are selectable:
   - adamw:       AdamW over all trainable params
-  - local_muon:  local Muon for hidden matrices + AdamW for embeddings / norms / heads
   - flash_muon:  nil0x9/flash-muon for hidden matrices + AdamW fallback
 
 Genesis uses:
@@ -31,7 +30,7 @@ Usage:
         --log_every 100
 
     # Direct common entrypoint:
-    python benchmark.py --model genesis --optimizer local_muon
+    python benchmark.py --model genesis --optimizer flash_muon
 
     # Full isolated model x optimizer matrix:
     python run_full_benchmark.py --out_dir runs/full_benchmark
@@ -63,7 +62,6 @@ from transformers import AutoTokenizer
 
 # ------------------------------------------------------------------ models --
 from genesis import Genesis, GenesisConfig
-from muon import Muon
 from rexmodel import REX, REXConfig
 
 
@@ -179,7 +177,7 @@ GENESIS_500M = dict(
 # --------------------------------------------------------------------------
 # Optimizers
 # --------------------------------------------------------------------------
-OPTIMIZER_CHOICES = ("adamw", "local_muon", "flash_muon")
+OPTIMIZER_CHOICES = ("adamw", "flash_muon")
 
 
 @dataclass
@@ -339,64 +337,29 @@ def make_optimizer(
     if not split.muon_params:
         raise RuntimeError(f"{optimizer_key} requested but no hidden matrix parameters were found")
 
-    if optimizer_key == "local_muon":
-        optimizer = Muon(
-            [
-                {
-                    "params": split.muon_params,
-                    "use_muon": True,
-                    "lr": muon_lr,
-                },
-                {
-                    "params": split.adam_params,
-                    "use_muon": False,
-                    "lr": adam_lr,
-                    "adam_lr": adam_lr,
-                    "adam_betas": (0.9, 0.95),
-                    "adam_eps": 1e-8,
-                    "wd": weight_decay,
-                },
-            ],
-            lr=muon_lr,
-            wd=weight_decay,
-        )
-        _tag_group(
-            optimizer.param_groups[0],
-            role="muon",
-            base_lr=muon_lr,
-            min_lr=muon_min_lr,
-        )
-        _tag_group(
-            optimizer.param_groups[1],
-            role="adam_aux",
-            base_lr=adam_lr,
-            min_lr=adam_min_lr,
-            lr_key="adam_lr",
-        )
-    else:
-        if device.type != "cuda":
-            raise RuntimeError("flash_muon requires CUDA because its optimizer allocates CUDA update buffers")
-        FlashMuon = _import_flash_muon()
-        if device.index is not None:
-            torch.cuda.set_device(device)
-        _ensure_single_process_group(device)
-        muon_optimizer = FlashMuon(
-            split.muon_params,
-            lr=muon_lr,
-            weight_decay=weight_decay,
-            momentum=0.95,
-            rank=0,
-            world_size=1,
-        )
-        adam_optimizer = torch.optim.AdamW(
-            split.adam_params,
-            lr=adam_lr,
-            betas=(0.9, 0.95),
-            weight_decay=weight_decay,
-        )
-        _tag_optimizer_groups(muon_optimizer, role="muon", base_lr=muon_lr, min_lr=muon_min_lr)
-        _tag_optimizer_groups(adam_optimizer, role="adam_aux", base_lr=adam_lr, min_lr=adam_min_lr)
-        optimizer = OptimizerBundle([muon_optimizer, adam_optimizer])
+    if device.type != "cuda":
+        raise RuntimeError("flash_muon requires CUDA because its optimizer allocates CUDA update buffers")
+    FlashMuon = _import_flash_muon()
+    if device.index is not None:
+        torch.cuda.set_device(device)
+    _ensure_single_process_group(device)
+    muon_optimizer = FlashMuon(
+        split.muon_params,
+        lr=muon_lr,
+        weight_decay=weight_decay,
+        momentum=0.95,
+        rank=0,
+        world_size=1,
+    )
+    adam_optimizer = torch.optim.AdamW(
+        split.adam_params,
+        lr=adam_lr,
+        betas=(0.9, 0.95),
+        weight_decay=weight_decay,
+    )
+    _tag_optimizer_groups(muon_optimizer, role="muon", base_lr=muon_lr, min_lr=muon_min_lr)
+    _tag_optimizer_groups(adam_optimizer, role="adam_aux", base_lr=adam_lr, min_lr=adam_min_lr)
+    optimizer = OptimizerBundle([muon_optimizer, adam_optimizer])
 
     return optimizer, {
         "optimizer": optimizer_key,
@@ -754,7 +717,7 @@ def main(forced_model: str = None):
     if forced_model is not None:
         args.model = forced_model
     if args.optimizer is None:
-        args.optimizer = "local_muon" if args.model == "genesis" else "adamw"
+        args.optimizer = "flash_muon" if args.model == "genesis" else "adamw"
     if args.output_json is None:
         args.output_json = f"benchmark_{args.model}_{args.optimizer}.json"
 

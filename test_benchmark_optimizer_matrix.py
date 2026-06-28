@@ -123,6 +123,9 @@ class BenchmarkOptimizerMatrixTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
+    def test_local_muon_is_not_a_benchmark_choice(self):
+        self.assertNotIn("local_muon", benchmark.OPTIMIZER_CHOICES)
+
 
 if __name__ == "__main__":
     unittest.main()
