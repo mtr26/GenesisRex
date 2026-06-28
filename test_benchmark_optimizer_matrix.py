@@ -17,6 +17,18 @@ class TinyLM(torch.nn.Module):
         self.lm_head = torch.nn.Linear(8, 16, bias=False)
 
 
+class TinyRexLike(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(16, 8)
+        self.fc_out = torch.nn.Linear(8, 16, bias=False)
+        ff = torch.nn.Module()
+        ff.w3 = torch.nn.Linear(8, 32, bias=False)
+        block = torch.nn.Module()
+        block.ff = ff
+        self.blocks = torch.nn.ModuleList([block])
+
+
 class FakeFlashMuon(torch.optim.Optimizer):
     def __init__(self, params, **kwargs):
         super().__init__(params, kwargs)
@@ -52,6 +64,14 @@ class BenchmarkOptimizerMatrixTests(unittest.TestCase):
         self.assertIn(id(model.lm_head.weight), adam_ids)
         self.assertNotIn(id(model.embedding.weight), muon_ids)
         self.assertNotIn(id(model.lm_head.weight), muon_ids)
+
+    def test_rex_w3_is_a_muon_matrix_param(self):
+        model = TinyRexLike()
+
+        split = benchmark.split_optimizer_params(model, model_key="rex")
+
+        self.assertIn(id(model.blocks[0].ff.w3.weight), {id(p) for p in split.muon_params})
+        self.assertEqual(split.excluded_param_count, 0)
 
     def test_make_adamw_optimizer_is_available_for_both_models(self):
         for model_key in ("genesis", "rex"):

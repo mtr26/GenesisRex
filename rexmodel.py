@@ -285,7 +285,7 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor):
-        out = self.w2(F.silu(self.w1(x)))
+        out = self.w2(F.silu(self.w1(x)) * self.w3(x))
         out = self.dropout(out)
         return out
 

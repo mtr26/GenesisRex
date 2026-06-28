@@ -15,8 +15,7 @@ Genesis uses:
   - Chunked cross-entropy (no logit materialization)
   - torch.compile
 
-REX uses standard CE (as shipped). REX's dead w3 weights are excluded from
-Muon arms because they never receive gradients.
+REX uses standard CE (as shipped).
 
 Usage:
     python benchmark_genesis.py \
@@ -152,7 +151,7 @@ class ChunkedTokens(IterableDataset):
 REX_500M = dict(
     vocab_size=32000,   # Mistral tokenizer
     max_len=2048,
-    n_layers=22,        # 22 layers @ d=1152 -> ~497M despite dead w3 overhead
+    n_layers=22,        # 22 layers @ d=1152 -> ~497M
     n_heads=16,
     n_kv_heads=4,
     n_embd=1152,
@@ -225,26 +224,12 @@ def _module_param_ids(module) -> set:
     return {id(p) for p in module.parameters()}
 
 
-def _rex_dead_w3_param_ids(model) -> set:
-    if not hasattr(model, "blocks"):
-        return set()
-    ids = set()
-    for block in model.blocks:
-        ff = getattr(block, "ff", None)
-        w3 = getattr(ff, "w3", None)
-        if w3 is not None:
-            ids.update(id(p) for p in w3.parameters())
-    return ids
-
-
 def split_optimizer_params(model: torch.nn.Module, model_key: str) -> OptimizerSplit:
     """Split trainable params into hidden matrices for Muon and Adam fallback params."""
 
     adam_param_ids = set()
     for attr in ("embedding", "lm_head", "fc_out"):
         adam_param_ids.update(_module_param_ids(getattr(model, attr, None)))
-
-    excluded_ids = _rex_dead_w3_param_ids(model) if model_key == "rex" else set()
 
     muon_params, adam_params, excluded_params = [], [], []
     seen = set()
@@ -255,9 +240,7 @@ def split_optimizer_params(model: torch.nn.Module, model_key: str) -> OptimizerS
         seen.add(pid)
         if not p.requires_grad:
             continue
-        if pid in excluded_ids:
-            excluded_params.append(p)
-        elif p.ndim >= 2 and pid not in adam_param_ids:
+        if p.ndim >= 2 and pid not in adam_param_ids:
             muon_params.append(p)
         else:
             adam_params.append(p)
@@ -661,10 +644,6 @@ def param_stats(model, model_key: str):
     if model_key == "rex":
         stats["lm_head_params"] = model.fc_out.weight.numel()
         stats["tied_embeddings"] = model.embedding.weight is model.fc_out.weight
-        dead_w3 = sum(block.ff.w3.weight.numel() for block in model.blocks)
-        stats["rex_dead_w3_params"] = dead_w3
-        stats["active_params_excluding_dead_w3"] = total - dead_w3
-        stats["active_params_excluding_dead_w3_m"] = (total - dead_w3) / 1e6
     return stats
 
 
